@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import csv
 import io
 import re
 from typing import Optional
@@ -81,11 +82,66 @@ def _ensure_bronze_schema() -> None:
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{BRONZE_SCHEMA}`")
 
 
+def _detect_delimiter(csv_text: str) -> str:
+    """Best-effort detection of the delimiter used in the CSV payload."""
+    sample = csv_text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,\t|")
+        return dialect.delimiter
+    except csv.Error:
+        return ";"
+
+
+def _strip_preamble(csv_text: str, delimiter: str) -> str:
+    """Remove free-text preamble lines before the header row.
+
+    The legacy dump occasionally prepends a title line where almost all cells
+    are empty (e.g. "AKVAKULTURTILLATELSER ... ;;;;;"). This function scans for
+    the first line that looks like a real header (half or more of the cells are
+    populated) and returns the CSV starting from that line.
+    """
+    lines = csv_text.splitlines()
+    header_index = 0
+
+    for idx, line in enumerate(lines):
+        if not line.strip():
+            continue
+
+        lowered = line.strip().lower()
+        if lowered.startswith("sep="):
+            continue
+
+        cells = [cell.strip() for cell in line.split(delimiter)]
+        total = len(cells)
+        if total == 0:
+            continue
+
+        non_empty = sum(1 for cell in cells if cell)
+        # We consider the first line with at least half the cells populated
+        # to be the actual header row. This skips free-text titles where most
+        # columns are blank (like "AKVAKULTURTILLATELSER PR. ... ;;;;;").
+        if non_empty / total >= 0.5:
+            header_index = idx
+            break
+
+    return "\n".join(lines[header_index:])
+
+
 def _parse_csv_to_spark(csv_text: str) -> Optional[DataFrame]:
     if not csv_text.strip():
         return None
 
-    pdf = pd.read_csv(io.StringIO(csv_text), sep=None, engine="python")
+    csv_text = csv_text.lstrip("\ufeff")
+    delimiter = _detect_delimiter(csv_text)
+    cleaned_text = _strip_preamble(csv_text, delimiter)
+
+    pdf = pd.read_csv(
+        io.StringIO(cleaned_text),
+        sep=delimiter,
+        engine="python",
+        dtype=str,
+        keep_default_na=False,
+    )
     if pdf.empty:
         return None
 
