@@ -152,6 +152,30 @@ def iter_sites(page_size: int = 100, max_pages: Optional[int] = None, **filters)
             return
         k += 1
 
+
+def fetch_site_borders(site_nr: Union[int, str]) -> List[Dict[str, Any]]:
+    """Fetch site border metadata (including latitude/longitude points)."""
+
+    url = f"{BASE_URL}/api/v1/sites/{site_nr}/borders"
+    resp = SESSION.get(url, timeout=TIMEOUT)
+    return _parse_or_raise(resp)
+
+
+def fetch_site_border_points(site_nr: Union[int, str]) -> List[Tuple[float, float]]:
+    """Return a flat list of ``(latitude, longitude)`` tuples for a site's borders."""
+
+    borders = fetch_site_borders(site_nr)
+    points: List[Tuple[float, float]] = []
+    for border in borders:
+        for point in border.get("points", []):
+            latitude = point.get("latitude")
+            longitude = point.get("longitude")
+            if latitude is None or longitude is None:
+                continue
+            points.append((latitude, longitude))
+    return points
+
+
 # -----------------------
 # Lakehouse helpers
 # -----------------------
