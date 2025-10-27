@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import io
+import re
 from typing import Optional
 
 import pandas as pd
@@ -92,6 +93,51 @@ def _parse_csv_to_spark(csv_text: str) -> Optional[DataFrame]:
     return spark.createDataFrame(pdf)
 
 
+_INVALID_DELTA_COLUMN_CHARS = re.compile(r"[ ,;{}()\n\t=]+")
+
+
+def _sanitize_column_name(name: str) -> str:
+    """Return a Delta Lake compatible column name.
+
+    Delta Lake does not allow several punctuation characters (including
+    whitespace) in column names. The legacy CSV dump occasionally produces
+    such names (for example ``"AKVAKULTURTILLATELSER PR. 27-10-2025 "``). We
+    normalise them by
+
+    * stripping surrounding whitespace,
+    * replacing disallowed characters with underscores,
+    * collapsing repeated underscores, and
+    * prefixing names that start with a digit.
+
+    If the resulting name is empty, we fall back to a generated name.
+    """
+
+    cleaned = _INVALID_DELTA_COLUMN_CHARS.sub("_", name.strip())
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    if not cleaned:
+        cleaned = "col"
+    if cleaned[0].isdigit():
+        cleaned = f"col_{cleaned}"
+    return cleaned
+
+
+def _clean_dataframe_columns(df: DataFrame) -> DataFrame:
+    """Rename columns to satisfy Delta Lake naming requirements."""
+
+    new_names = []
+    seen = {}
+    for original in df.columns:
+        candidate = _sanitize_column_name(original)
+        if candidate in seen:
+            seen[candidate] += 1
+            candidate = f"{candidate}_{seen[candidate]}"
+        else:
+            seen[candidate] = 0
+        new_names.append(candidate)
+
+    return df.toDF(*new_names)
+
+
 # -----------------------
 # API
 # -----------------------
@@ -118,6 +164,7 @@ def load_csv_dump_to_bronze(overwrite: bool = True) -> int:
     spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
     _ensure_bronze_schema()
 
+    df = _clean_dataframe_columns(df)
     df = df.withColumn("ingestion_ts", F.current_timestamp())
 
     writer = (
