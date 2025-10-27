@@ -32,9 +32,11 @@ STATUS_FORCELIST = (429, 500, 502, 503, 504)
 # IMPORTANT: your lakehouse/database name
 LAKEHOUSE_DB     = "LH_ClientDemo"          # <— change only if your lakehouse is named differently
 # --- CONFIG (2-part names; requires the notebook to have LH_ClientDemo attached) ---
-BRONZE_SCHEMA = "A_Bronze"
-TABLE_NAME    = "PubAqua_Sites_Raw"
-BRONZE_TABLE  = f"`{BRONZE_SCHEMA}`.`{TABLE_NAME}`"   # e.g. A_Bronze.PubAqua_Sites_Raw
+BRONZE_SCHEMA          = "A_Bronze"
+SITES_TABLE_NAME       = "PubAqua_Sites_Raw"
+ENTITIES_TABLE_NAME    = "PubAqua_Entities_Raw"
+SITES_BRONZE_TABLE     = f"`{BRONZE_SCHEMA}`.`{SITES_TABLE_NAME}`"     # e.g. A_Bronze.PubAqua_Sites_Raw
+ENTITIES_BRONZE_TABLE  = f"`{BRONZE_SCHEMA}`.`{ENTITIES_TABLE_NAME}`"
 
 # -----------------------
 # HTTP session with retry
@@ -157,7 +159,7 @@ def _ensure_bronze_schema() -> None:
     # Rely on the attached lakehouse; no USE CATALOG / USE <db>
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{BRONZE_SCHEMA}`")
 
-def _write_batch_to_bronze(batch: List[Dict[str, Any]]) -> int:
+def _write_batch_to_bronze(batch: List[Dict[str, Any]], table_name: str) -> int:
     if not batch:
         return 0
 
@@ -172,42 +174,121 @@ def _write_batch_to_bronze(batch: List[Dict[str, Any]]) -> int:
     (df.write
        .format("delta")
        .mode("append")
-       .saveAsTable(BRONZE_TABLE))
+       .saveAsTable(table_name))
 
     return df.count()
 
 def load_sites_to_bronze(page_size: int = 100, max_pages: Optional[int] = None, **filters) -> int:
     total = 0
     for k, batch in iter_sites(page_size=page_size, max_pages=max_pages, **filters):
-        written = _write_batch_to_bronze(batch)
+        written = _write_batch_to_bronze(batch, SITES_BRONZE_TABLE)
         total += written
-        print(f"Written page {k} ({written} rows) → {BRONZE_TABLE}")
-    print(f"Total rows written → {BRONZE_TABLE}: {total}")
+        print(f"Written page {k} ({written} rows) → {SITES_BRONZE_TABLE}")
+    print(f"Total rows written → {SITES_BRONZE_TABLE}: {total}")
+    return total
+
+def _build_entities_query(
+    entity_nr_id: Optional[str] = None,
+    entity_nr: Optional[str] = None,
+    name: Optional[str] = None,
+    zip_code: Optional[str] = None,
+    zip_name: Optional[str] = None,
+    county_code: Optional[str] = None,
+    county_name: Optional[str] = None,
+    country_code: Optional[str] = None,
+    country_name: Optional[str] = None,
+    range_: Optional[str] = None,
+) -> Dict[str, Any]:
+    q: Dict[str, Any] = {}
+    if entity_nr_id: q["entity-nr-id"] = entity_nr_id
+    if entity_nr: q["entity-nr"] = entity_nr
+    if name: q["name"] = name
+    if zip_code: q["zip-code"] = zip_code
+    if zip_name: q["zip-name"] = zip_name
+    if county_code: q["county-code"] = county_code
+    if county_name: q["county-name"] = county_name
+    if country_code: q["country-code"] = country_code
+    if country_name: q["country-name"] = country_name
+    if range_: q["range"] = range_
+    return q
+
+def fetch_entities_once(**filters) -> List[Dict[str, Any]]:
+    params = _build_entities_query(**filters)
+    url = f"{BASE_URL}/api/v1/entities"
+    resp = SESSION.get(url, params=params, timeout=TIMEOUT)
+    return _parse_or_raise(resp)
+
+def iter_entities(page_size: int = 100, max_pages: Optional[int] = None, **filters) -> Iterable[Tuple[int, List[Dict[str, Any]]]]:
+    if page_size > 100:
+        page_size = 100
+    k = 0
+    while True:
+        if max_pages is not None and k >= max_pages:
+            return
+        start = k * page_size
+        end   = start + page_size - 1
+        batch = fetch_entities_once(range_=f"{start}-{end}", **filters)
+        if not batch:
+            return
+        yield k, batch
+        if len(batch) < page_size:
+            return
+        k += 1
+
+def load_entities_to_bronze(page_size: int = 100, max_pages: Optional[int] = None, **filters) -> int:
+    total = 0
+    for k, batch in iter_entities(page_size=page_size, max_pages=max_pages, **filters):
+        written = _write_batch_to_bronze(batch, ENTITIES_BRONZE_TABLE)
+        total += written
+        print(f"Written page {k} ({written} rows) → {ENTITIES_BRONZE_TABLE}")
+    print(f"Total rows written → {ENTITIES_BRONZE_TABLE}: {total}")
     return total
 
 # -----------------------
 # Run
 # -----------------------
 if __name__ == "__main__":
-    total = load_sites_to_bronze()
+    total_sites = load_sites_to_bronze()
 
     spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
-    print(f"Previewing the first rows from {BRONZE_TABLE} (total written: {total})")
-    preview = spark.sql(f"""
+    print(f"Previewing the first rows from {SITES_BRONZE_TABLE} (total written: {total_sites})")
+    sites_preview = spark.sql(f"""
         SELECT
             get_json_object(payload, '$.siteNr')                 AS siteNr,
             get_json_object(payload, '$.name')                   AS name,
             get_json_object(payload, '$.water')                  AS water,
             get_json_object(payload, '$.productionAreaCode')     AS productionAreaCode,
             ingestion_ts
-        FROM {BRONZE_TABLE}
+        FROM {SITES_BRONZE_TABLE}
         ORDER BY siteNr
         LIMIT 25
     """)
 
     try:
-        display(preview)
+        display(sites_preview)
     except Exception:
         import pandas as pd
         from IPython.display import display as ipy_display
-        ipy_display(preview.toPandas())
+        ipy_display(sites_preview.toPandas())
+
+    total_entities = load_entities_to_bronze()
+    print(f"Previewing the first rows from {ENTITIES_BRONZE_TABLE} (total written: {total_entities})")
+    entities_preview = spark.sql(f"""
+        SELECT
+            get_json_object(payload, '$.entityNr')           AS entityNr,
+            get_json_object(payload, '$.entityNrId')         AS entityNrId,
+            get_json_object(payload, '$.name')               AS name,
+            get_json_object(payload, '$.zipCode')            AS zipCode,
+            get_json_object(payload, '$.countyName')         AS countyName,
+            ingestion_ts
+        FROM {ENTITIES_BRONZE_TABLE}
+        ORDER BY entityNr
+        LIMIT 25
+    """)
+
+    try:
+        display(entities_preview)
+    except Exception:
+        import pandas as pd
+        from IPython.display import display as ipy_display
+        ipy_display(entities_preview.toPandas())
