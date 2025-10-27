@@ -4,7 +4,7 @@
 from __future__ import annotations
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -17,7 +17,8 @@ except Exception:
     _RETRY_KW = dict(method_whitelist=frozenset(["GET"]))  # type: ignore
 
 from notebookutils import mssparkutils
-from pyspark.sql import SparkSession, functions as F, types as T
+from pyspark.sql import Column, SparkSession, functions as F
+from pyspark.sql.utils import AnalysisException
 
 # -----------------------
 # Configuration
@@ -159,29 +160,113 @@ def _ensure_bronze_schema() -> None:
     # Rely on the attached lakehouse; no USE CATALOG / USE <db>
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{BRONZE_SCHEMA}`")
 
-def _write_batch_to_bronze(batch: List[Dict[str, Any]], table_name: str) -> int:
+def _json_batch_to_df(spark: SparkSession, batch: List[Dict[str, Any]]):
+    json_rows = [json.dumps(r, ensure_ascii=False) for r in batch]
+    return spark.read.json(spark.sparkContext.parallelize(json_rows))
+
+
+ColumnBuilder = Callable[["DataFrame"], Column]
+
+
+def _col(name: str) -> ColumnBuilder:
+    def builder(df: "DataFrame") -> Column:
+        return F.col(name)
+
+    return builder
+
+
+def _first_address_field(field_name: str) -> ColumnBuilder:
+    def builder(df: "DataFrame") -> Column:
+        return F.col("addresses").getItem(0).getField(field_name)
+
+    return builder
+
+
+def _select_columns(
+    df: "DataFrame",
+    columns: List[Tuple[str, ColumnBuilder]],
+) -> "DataFrame":
+    selected: List[Column] = []
+    for alias, builder in columns:
+        try:
+            candidate = builder(df)
+            df.select(candidate)
+        except AnalysisException:
+            continue
+        selected.append(candidate.alias(alias))
+
+    if not selected:
+        return df
+    return df.select(*selected)
+
+
+SITES_TABLE_COLUMNS: List[Tuple[str, ColumnBuilder]] = [
+    ("siteNr", _col("siteNr")),
+    ("name", _col("name")),
+    ("licenseNr", _col("licenseNr")),
+    ("activity", _col("activity")),
+    ("operation", _col("operation")),
+    ("placement", _col("placement")),
+    ("water", _col("water")),
+    ("municipalityCode", _col("municipalityCode")),
+    ("municipalityName", _col("municipalityName")),
+    ("countyCode", _col("countyCode")),
+    ("countyName", _col("countyName")),
+    ("productionAreaCode", _col("productionAreaCode")),
+    ("productionAreaName", _col("productionAreaName")),
+]
+
+
+ENTITIES_TABLE_COLUMNS: List[Tuple[str, ColumnBuilder]] = [
+    ("entityId", lambda df: F.col("id")),
+    ("versionId", _col("versionId")),
+    ("name", _col("name")),
+    ("typeName", _col("typeName")),
+    ("openNr", _col("openNr")),
+    ("primaryZipCode", _first_address_field("zipCode")),
+    ("primaryCountyName", _first_address_field("countyName")),
+]
+
+
+def _sites_batch_to_table_df(spark: SparkSession, batch: List[Dict[str, Any]]):
+    raw_df = _json_batch_to_df(spark, batch)
+    return _select_columns(raw_df, SITES_TABLE_COLUMNS)
+
+
+def _entities_batch_to_table_df(spark: SparkSession, batch: List[Dict[str, Any]]):
+    raw_df = _json_batch_to_df(spark, batch)
+    return _select_columns(raw_df, ENTITIES_TABLE_COLUMNS)
+
+
+def _write_batch_to_bronze(
+    batch: List[Dict[str, Any]],
+    table_name: str,
+    transform: Callable[[SparkSession, List[Dict[str, Any]]], "DataFrame"],
+) -> int:
     if not batch:
         return 0
 
     spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
     _ensure_bronze_schema()
 
-    json_rows = [(json.dumps(r, ensure_ascii=False),) for r in batch]
-    df = spark.createDataFrame(json_rows, schema=T.StructType([T.StructField("payload", T.StringType(), False)]))
+    df = transform(spark, batch)
     df = df.withColumn("ingestion_ts", F.current_timestamp())
 
     # Append as managed Delta table under LH_ClientDemo ▸ A_Bronze
-    (df.write
-       .format("delta")
-       .mode("append")
-       .saveAsTable(table_name))
+    (
+        df.write
+        .format("delta")
+        .mode("append")
+        .option("mergeSchema", "true")
+        .saveAsTable(table_name)
+    )
 
     return df.count()
 
 def load_sites_to_bronze(page_size: int = 100, max_pages: Optional[int] = 1, **filters) -> int:
     total = 0
     for k, batch in iter_sites(page_size=page_size, max_pages=max_pages, **filters):
-        written = _write_batch_to_bronze(batch, SITES_BRONZE_TABLE)
+        written = _write_batch_to_bronze(batch, SITES_BRONZE_TABLE, _sites_batch_to_table_df)
         total += written
         print(f"Written page {k} ({written} rows) → {SITES_BRONZE_TABLE}")
     print(f"Total rows written → {SITES_BRONZE_TABLE}: {total}")
@@ -238,7 +323,11 @@ def iter_entities(page_size: int = 100, max_pages: Optional[int] = None, **filte
 def load_entities_to_bronze(page_size: int = 100, max_pages: Optional[int] = 1, **filters) -> int:
     total = 0
     for k, batch in iter_entities(page_size=page_size, max_pages=max_pages, **filters):
-        written = _write_batch_to_bronze(batch, ENTITIES_BRONZE_TABLE)
+        written = _write_batch_to_bronze(
+            batch,
+            ENTITIES_BRONZE_TABLE,
+            _entities_batch_to_table_df,
+        )
         total += written
         print(f"Written page {k} ({written} rows) → {ENTITIES_BRONZE_TABLE}")
     print(f"Total rows written → {ENTITIES_BRONZE_TABLE}: {total}")
@@ -252,15 +341,16 @@ if __name__ == "__main__":
 
     spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
     print(f"Previewing the first rows from {SITES_BRONZE_TABLE} (total written: {total_sites})")
-    sites_preview = spark.sql(f"""
-        SELECT
-            get_json_object(payload, '$.siteNr')                 AS siteNr,
-            get_json_object(payload, '$.name')                   AS name,
-            ingestion_ts
-        FROM {SITES_BRONZE_TABLE}
-        ORDER BY siteNr
-        LIMIT 25
-    """)
+    sites_table = spark.table(SITES_BRONZE_TABLE)
+    site_columns = [alias for alias, _ in SITES_TABLE_COLUMNS if alias in sites_table.columns]
+    if site_columns:
+        site_columns.append("ingestion_ts")
+    else:
+        site_columns = sites_table.columns
+    sites_preview = sites_table.select(*site_columns)
+    if "siteNr" in site_columns:
+        sites_preview = sites_preview.orderBy(F.col("siteNr"))
+    sites_preview = sites_preview.limit(25)
 
     try:
         display(sites_preview)
@@ -271,20 +361,16 @@ if __name__ == "__main__":
 
     total_entities = load_entities_to_bronze()
     print(f"Previewing the first rows from {ENTITIES_BRONZE_TABLE} (total written: {total_entities})")
-    entities_preview = spark.sql(f"""
-        SELECT
-            get_json_object(payload, '$.id')                      AS entityId,
-            get_json_object(payload, '$.versionId')               AS versionId,
-            get_json_object(payload, '$.name')                    AS name,
-            get_json_object(payload, '$.typeName')                AS typeName,
-            get_json_object(payload, '$.openNr')                  AS openNr,
-            get_json_object(payload, '$.addresses[0].zipCode')    AS primaryZipCode,
-            get_json_object(payload, '$.addresses[0].countyName') AS primaryCountyName,
-            ingestion_ts
-        FROM {ENTITIES_BRONZE_TABLE}
-        ORDER BY entityId
-        LIMIT 25
-    """)
+    entities_table = spark.table(ENTITIES_BRONZE_TABLE)
+    entity_columns = [alias for alias, _ in ENTITIES_TABLE_COLUMNS if alias in entities_table.columns]
+    if entity_columns:
+        entity_columns.append("ingestion_ts")
+    else:
+        entity_columns = entities_table.columns
+    entities_preview = entities_table.select(*entity_columns)
+    if "entityId" in entity_columns:
+        entities_preview = entities_preview.orderBy(F.col("entityId"))
+    entities_preview = entities_preview.limit(25)
 
     try:
         display(entities_preview)
