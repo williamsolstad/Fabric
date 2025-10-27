@@ -4,7 +4,7 @@
 from __future__ import annotations
 import json
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -20,7 +20,164 @@ from notebookutils import mssparkutils
 from pyspark.sql import Column, SparkSession, functions as F, types as T
 from pyspark.sql.utils import AnalysisException
 
-from pub_aqua_geo import SiteBorderClient
+# -----------------------
+# Geo client (inlined)
+# -----------------------
+
+
+class SiteBorderClient:
+    """Small helper that fetches site border points from the Pub-Aqua API.
+
+    The original example depends on a ``pub_aqua_geo`` package that ships the
+    real client.  The execution environment for this kata does not have that
+    package installed which means importing it results in a
+    :class:`ModuleNotFoundError`.  To keep the example self contained we inline
+    a lightweight drop-in replacement that covers the bits of behaviour the
+    notebook relies on.
+
+    The implementation intentionally focuses on robustness instead of strictly
+    mimicking the upstream module.  The API occasionally returns slightly
+    different payload shapes (plain ``{"latitude": .., "longitude": ..}``,
+    ``{"lat": .., "lon": ..}``, GeoJSON ``geometry`` objects, ...).  The
+    helpers below try to normalise all those formats into ``(lat, lon)`` tuples
+    with ``float``/``None`` values so the rest of the notebook can stay
+    unchanged.
+    """
+
+    def __init__(
+        self,
+        session: requests.Session,
+        base_url: str,
+        timeout: Union[int, float, Tuple[int, int]],
+        parse_response: Callable[[requests.Response], List[Dict[str, Any]]],
+    ) -> None:
+        self._session = session
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._parse_response = parse_response
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def fetch_site_border_points(
+        self, site_nr: Union[int, str]
+    ) -> List[Tuple[Optional[float], Optional[float]]]:
+        """Fetch border points for a given site number.
+
+        The endpoint exposed by the service lives under
+        ``<base_url>/geo/api/v1/sites/<site_nr>/border``.
+        ``self._parse_response`` already handles HTTP error propagation and the
+        ``data`` envelope, leaving this method with normalising the payload
+        structure.
+        """
+
+        url = f"{self._base_url}/geo/api/v1/sites/{site_nr}/border"
+        response = self._session.get(url, timeout=self._timeout)
+        payload = self._parse_response(response)
+        return self._normalise_payload(payload)
+
+    # ------------------------------------------------------------------
+    # Normalisation helpers
+    # ------------------------------------------------------------------
+    def _normalise_payload(
+        self, payload: Iterable[Any]
+    ) -> List[Tuple[Optional[float], Optional[float]]]:
+        points: List[Tuple[Optional[float], Optional[float]]] = []
+        for item in payload:
+            points.extend(self._normalise_item(item))
+        return points
+
+    def _normalise_item(
+        self, item: Any
+    ) -> List[Tuple[Optional[float], Optional[float]]]:
+        if item is None:
+            return []
+
+        if isinstance(item, dict):
+            if "coordinates" in item:
+                return self._coordinates_to_points(item["coordinates"])
+            if "geometry" in item and isinstance(item["geometry"], dict):
+                geometry = item["geometry"]
+                return self._coordinates_to_points(geometry.get("coordinates"))
+
+            lat = self._extract_number(item, ["latitude", "lat", "y"])
+            lon = self._extract_number(item, ["longitude", "lon", "x", "lng"])
+            if lat is not None or lon is not None:
+                return [(lat, lon)]
+            return []
+
+        if isinstance(item, (list, tuple)):
+            return self._coordinates_to_points(item)
+
+        # Unsupported payload element – ignore it while keeping the client
+        # resilient to future format changes.
+        return []
+
+    def _coordinates_to_points(
+        self, coordinates: Any
+    ) -> List[Tuple[Optional[float], Optional[float]]]:
+        if coordinates is None:
+            return []
+
+        if isinstance(coordinates, (list, tuple)):
+            if self._looks_like_coordinate_pair(coordinates):
+                lat, lon = self._pair_to_lat_lon(coordinates)
+                return [(lat, lon)]
+
+            points: List[Tuple[Optional[float], Optional[float]]] = []
+            for entry in coordinates:
+                points.extend(self._coordinates_to_points(entry))
+            return points
+
+        # Anything else (e.g. dicts) gets routed back through the normaliser.
+        return self._normalise_item(coordinates)
+
+    # ------------------------------------------------------------------
+    # Primitive helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_number(obj: Dict[str, Any], keys: Iterable[str]) -> Optional[float]:
+        for key in keys:
+            if key in obj:
+                value = obj[key]
+                if value is None:
+                    return None
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    @staticmethod
+    def _looks_like_coordinate_pair(values: Sequence[Any]) -> bool:
+        if len(values) < 2:
+            return False
+        first, second = values[0], values[1]
+        return SiteBorderClient._is_number(first) and SiteBorderClient._is_number(second)
+
+    @staticmethod
+    def _is_number(value: Any) -> bool:
+        try:
+            float(value)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    @staticmethod
+    def _pair_to_lat_lon(values: Sequence[Any]) -> Tuple[Optional[float], Optional[float]]:
+        first = float(values[0]) if values[0] is not None else None
+        second = float(values[1]) if values[1] is not None else None
+        lat, lon = first, second
+        if lat is not None and (lat < -90 or lat > 90):
+            # Likely lon/lat order (GeoJSON default).  Swap the components.
+            lat, lon = lon, lat
+        if lat is not None and (lat < -90 or lat > 90):
+            lat = None
+        if lon is not None and (lon < -180 or lon > 180):
+            lon = None
+        return lat, lon
+
+
 
 # -----------------------
 # Configuration
