@@ -20,7 +20,130 @@ from notebookutils import mssparkutils
 from pyspark.sql import Column, SparkSession, functions as F, types as T
 from pyspark.sql.utils import AnalysisException
 
-from pub_aqua_geo import SiteBorderClient
+# The original notebook imported `SiteBorderClient` from the
+# `pub_aqua_geo` package.  The package is not available in this
+# repository, therefore we provide a small in-file implementation that
+# covers the behaviour relied upon by the rest of the notebook.  The
+# helper retries a collection of known endpoint patterns and normalises
+# the payload into a list of coordinate pairs.
+class SiteBorderClient:
+    """Fetches site border points from the Pub-Aqua API.
+
+    The historical implementation lived in the ``pub_aqua_geo`` package.
+    We replicate only the functionality that is required by this example
+    notebook: download a list of latitude/longitude pairs for a given
+    ``siteNr``.  The client tries a set of documented endpoint patterns
+    because the public API has changed shape a couple of times.  The
+    first endpoint returning a successful response is used.
+    """
+
+    _CANDIDATE_ENDPOINTS = (
+        "/api/v1/sites/{site_nr}/border",
+        "/api/v1/site-borders/{site_nr}",
+        "/api/v1/site-border-points",
+        "/geo/api/v1/sites/{site_nr}/border",
+        "/geo/api/v1/site-borders/{site_nr}",
+        "/geo/api/v1/site-border-points",
+    )
+
+    def __init__(
+        self,
+        session: requests.Session,
+        base_url: str,
+        timeout: Tuple[int, int] | float,
+        parse_response: Callable[[requests.Response], List[Dict[str, Any]]],
+    ) -> None:
+        self._session = session
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._parse_response = parse_response
+
+    def _iter_candidate_urls(self, site_nr: Union[int, str]) -> Iterable[Tuple[str, Dict[str, Any]]]:
+        site_identifier = str(site_nr).strip()
+        if not site_identifier:
+            raise ValueError("site number must not be blank")
+
+        for template in self._CANDIDATE_ENDPOINTS:
+            if "{site_nr}" in template:
+                yield f"{self._base_url}{template.format(site_nr=site_identifier)}", {}
+            else:
+                # Endpoints that expect the site number as a query parameter
+                yield f"{self._base_url}{template}", {"siteNr": site_identifier}
+
+    @staticmethod
+    def _normalise_points(payload: Any) -> List[Tuple[Any, Any]]:
+        if payload is None:
+            return []
+        if isinstance(payload, dict):
+            # Standardise payloads shaped as {"data": [...]}
+            if isinstance(payload.get("data"), list):
+                return SiteBorderClient._normalise_points(payload["data"])
+            if isinstance(payload.get("border"), list):
+                return SiteBorderClient._normalise_points(payload["border"])
+            # Some endpoints return a GeoJSON feature collection
+            features = payload.get("features")
+            if isinstance(features, list):
+                points: List[Tuple[Any, Any]] = []
+                for feature in features:
+                    geometry = feature.get("geometry", {}) if isinstance(feature, dict) else {}
+                    coords = geometry.get("coordinates") if isinstance(geometry, dict) else None
+                    if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                        points.append((coords[1], coords[0]))
+                return points
+            # Single feature represented as a dict with latitude/longitude
+            lat = payload.get("latitude") or payload.get("lat")
+            lon = payload.get("longitude") or payload.get("lon")
+            if lat is not None or lon is not None:
+                return [(lat, lon)]
+            return []
+        if isinstance(payload, (list, tuple)):
+            points: List[Tuple[Any, Any]] = []
+            for item in payload:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    points.append((item[0], item[1]))
+                elif isinstance(item, dict):
+                    lat = item.get("latitude") or item.get("lat") or item.get("y")
+                    lon = item.get("longitude") or item.get("lon") or item.get("x")
+                    if lat is None and lon is None:
+                        coords = item.get("coordinates")
+                        if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+                            lat, lon = coords[1], coords[0]
+                    if lat is not None or lon is not None:
+                        points.append((lat, lon))
+            return points
+        return []
+
+    def fetch_site_border_points(self, site_nr: Union[int, str]) -> List[Tuple[Any, Any]]:
+        last_error: Optional[requests.HTTPError] = None
+        for url, params in self._iter_candidate_urls(site_nr):
+            resp = self._session.get(url, params=params or None, timeout=self._timeout)
+            if resp.status_code == 404:
+                continue
+            try:
+                payload = self._parse_response(resp)
+            except requests.HTTPError as exc:  # pragma: no cover - defensive
+                last_error = exc
+                continue
+
+            points = self._normalise_points(payload)
+            if points:
+                return points
+            # The helper above returns [] for empty payloads; fall back to
+            # parsing the raw JSON if the original handler filtered the data
+            try:
+                raw_payload = resp.json()
+            except ValueError:
+                raw_payload = None
+            points = self._normalise_points(raw_payload)
+            if points:
+                return points
+
+        if last_error is not None:
+            raise last_error
+        raise requests.HTTPError(
+            f"Unable to fetch border points for site {site_nr};"
+            " all known endpoints returned 404 or empty payloads."
+        )
 
 # -----------------------
 # Configuration
@@ -334,16 +457,23 @@ def load_site_border_points_to_bronze(site_numbers: Iterable[Union[int, str]]) -
     for site_nr in site_numbers:
         rows.extend(fetch_site_border_points(site_nr))
 
-    if not rows:
-        return 0
-
     spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
     _ensure_bronze_schema()
 
-    df = spark.createDataFrame(
-        rows,
-        schema=["siteNr", "pointIndex", "latitude", "longitude"],
+    schema = T.StructType(
+        [
+            T.StructField("siteNr", T.StringType(), False),
+            T.StructField("pointIndex", T.IntegerType(), False),
+            T.StructField("latitude", T.DoubleType(), True),
+            T.StructField("longitude", T.DoubleType(), True),
+        ]
     )
+
+    if rows:
+        df = spark.createDataFrame(rows, schema=schema)
+    else:
+        df = spark.createDataFrame([], schema=schema)
+
     df = df.withColumn("ingestion_ts", F.current_timestamp())
 
     (
@@ -478,36 +608,35 @@ if __name__ == "__main__":
         from IPython.display import display as ipy_display
         ipy_display(sites_preview.toPandas())
 
-    border_preview_df = None
     if "siteNr" in site_columns:
-        site_numbers = [row["siteNr"] for row in sites_preview.select("siteNr").limit(5).collect()]
-        if site_numbers:
-            written_border_points = load_site_border_points_to_bronze(site_numbers)
-        else:
-            written_border_points = 0
-        if written_border_points:
-            print(
-                "Written border point rows "
-                f"→ {SITE_BORDER_POINTS_BRONZE_TABLE}: {written_border_points}"
-            )
-            border_preview_df = (
-                spark.table(SITE_BORDER_POINTS_BRONZE_TABLE)
-                .orderBy(F.col("siteNr"), F.col("pointIndex"))
-                .limit(25)
-            )
-        else:
-            print("No border points written for preview.")
+        site_numbers = [
+            row["siteNr"]
+            for row in sites_preview.select("siteNr").limit(5).collect()
+        ]
     else:
-        print("No site numbers available to fetch border points.")
-    if border_preview_df is not None:
-        print("Previewing the first border points (limit 5 sites)")
-        try:
-            display(border_preview_df)
-        except Exception:
-            import pandas as pd
-            from IPython.display import display as ipy_display
+        site_numbers = []
+        print("No site numbers available to fetch border points; writing empty table.")
 
-            ipy_display(border_preview_df.toPandas())
+    written_border_points = load_site_border_points_to_bronze(site_numbers)
+    print(
+        "Written border point rows "
+        f"→ {SITE_BORDER_POINTS_BRONZE_TABLE}: {written_border_points}"
+    )
+
+    border_preview_df = (
+        spark.table(SITE_BORDER_POINTS_BRONZE_TABLE)
+        .orderBy(F.col("siteNr"), F.col("pointIndex"))
+        .limit(25)
+    )
+
+    print("Previewing the first border points (limit 5 sites)")
+    try:
+        display(border_preview_df)
+    except Exception:
+        import pandas as pd
+        from IPython.display import display as ipy_display
+
+        ipy_display(border_preview_df.toPandas())
 
     total_entities = load_entities_to_bronze()
     print(f"Previewing the first rows from {ENTITIES_BRONZE_TABLE} (total written: {total_entities})")
