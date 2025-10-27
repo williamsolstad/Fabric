@@ -172,7 +172,7 @@ def _write_batch_to_bronze(batch: List[Dict[str, Any]]) -> int:
     (df.write
        .format("delta")
        .mode("append")
-       .saveAsTable(BRONZE_TABLE_2P))
+       .saveAsTable(BRONZE_TABLE))
 
     return df.count()
 
@@ -181,19 +181,18 @@ def load_sites_to_bronze(page_size: int = 100, max_pages: Optional[int] = None, 
     for k, batch in iter_sites(page_size=page_size, max_pages=max_pages, **filters):
         written = _write_batch_to_bronze(batch)
         total += written
-        print(f"Written page {k} ({written} rows) → {BRONZE_TABLE_FQN}")
-    print(f"Total rows written → {BRONZE_TABLE_FQN}: {total}")
+        print(f"Written page {k} ({written} rows) → {BRONZE_TABLE}")
+    print(f"Total rows written → {BRONZE_TABLE}: {total}")
     return total
 
 # -----------------------
 # Run
 # -----------------------
 if __name__ == "__main__":
-        # write
-    (df.write.format("delta").mode("append").saveAsTable(BRONZE_TABLE))
+    total = load_sites_to_bronze()
 
-    # log lines / preview
-    print(f"Written page {k} ({written} rows) → {BRONZE_TABLE}")
+    spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+    print(f"Previewing the first rows from {BRONZE_TABLE} (total written: {total})")
     preview = spark.sql(f"""
         SELECT
             get_json_object(payload, '$.siteNr')                 AS siteNr,
