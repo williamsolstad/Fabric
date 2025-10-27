@@ -17,7 +17,7 @@ except Exception:
     _RETRY_KW = dict(method_whitelist=frozenset(["GET"]))  # type: ignore
 
 from notebookutils import mssparkutils
-from pyspark.sql import Column, SparkSession, functions as F
+from pyspark.sql import Column, SparkSession, functions as F, types as T
 from pyspark.sql.utils import AnalysisException
 
 from pub_aqua_geo import SiteBorderClient
@@ -40,6 +40,8 @@ SITES_TABLE_NAME       = "PubAqua_Sites_Raw"
 ENTITIES_TABLE_NAME    = "PubAqua_Entities_Raw"
 SITES_BRONZE_TABLE     = f"`{BRONZE_SCHEMA}`.`{SITES_TABLE_NAME}`"     # e.g. A_Bronze.PubAqua_Sites_Raw
 ENTITIES_BRONZE_TABLE  = f"`{BRONZE_SCHEMA}`.`{ENTITIES_TABLE_NAME}`"
+SITE_BORDER_POINTS_TABLE_NAME = "PubAqua_SiteBorderPoints_Raw"
+SITE_BORDER_POINTS_BRONZE_TABLE = f"`{BRONZE_SCHEMA}`.`{SITE_BORDER_POINTS_TABLE_NAME}`"
 
 # -----------------------
 # HTTP session with retry
@@ -60,13 +62,9 @@ def _build_session() -> requests.Session:
     s.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
     return s
 
+# Forward declarations rely on helpers defined later in the file.  The API
+# client is initialised after the response parser is declared.
 SESSION = _build_session()
-BORDER_CLIENT = SiteBorderClient(
-    session=SESSION,
-    base_url=BASE_URL,
-    timeout=TIMEOUT,
-    parse_response=_parse_or_raise,
-)
 
 # -----------------------
 # Helpers
@@ -134,6 +132,14 @@ def _parse_or_raise(resp: requests.Response) -> List[Dict[str, Any]]:
         return data
     return []
 
+
+BORDER_CLIENT = SiteBorderClient(
+    session=SESSION,
+    base_url=BASE_URL,
+    timeout=TIMEOUT,
+    parse_response=_parse_or_raise,
+)
+
 # -----------------------
 # API (single + iterator)
 # -----------------------
@@ -184,6 +190,17 @@ def _col(name: str) -> ColumnBuilder:
     return builder
 
 
+PLACEMENT_FIELD_SPECS: List[Tuple[str, T.DataType]] = [
+    ("municipalityCode", T.StringType()),
+    ("municipalityName", T.StringType()),
+    ("countyCode", T.StringType()),
+    ("countyName", T.StringType()),
+    ("prodAreaCode", T.StringType()),
+    ("prodAreaName", T.StringType()),
+    ("prodAreaStatus", T.StringType()),
+]
+
+
 def _first_address_field(field_name: str) -> ColumnBuilder:
     def builder(df: "DataFrame") -> Column:
         return F.col("addresses").getItem(0).getField(field_name)
@@ -197,6 +214,28 @@ def _first_connection_field(field_name: str) -> ColumnBuilder:
         return F.when(F.size(connections) > 0, connections.getItem(0).getField(field_name))
 
     return builder
+
+
+def _placement_struct(df: "DataFrame") -> Column:
+    placement_field = next((field for field in df.schema if field.name == "placement"), None)
+    if placement_field is None or not isinstance(placement_field.dataType, T.StructType):
+        null_columns = [
+            F.lit(None).cast(data_type).alias(name) for name, data_type in PLACEMENT_FIELD_SPECS
+        ]
+        return F.struct(*null_columns)
+
+    placement_schema = placement_field.dataType
+    assert isinstance(placement_schema, T.StructType)
+    schema_field_names = {field.name for field in placement_schema}
+
+    columns: List[Column] = []
+    for name, data_type in PLACEMENT_FIELD_SPECS:
+        if name in schema_field_names:
+            columns.append(F.col(f"placement.{name}").cast(data_type).alias(name))
+        else:
+            columns.append(F.lit(None).cast(data_type).alias(name))
+
+    return F.struct(*columns)
 
 
 def _select_columns(
@@ -241,7 +280,7 @@ SITES_TABLE_COLUMNS: List[Tuple[str, ColumnBuilder]] = [
             F.lit("JOINT"),
         ).otherwise(F.lit("SOLO")),
     ),
-    ("placement", _col("placement")),
+    ("placement", _placement_struct),
     ("placementType", _col("placementTypeValue")),
     ("water", _col("waterTypeValue")),
     ("municipalityCode", _col("placement.municipalityCode")),
@@ -272,6 +311,50 @@ def _sites_batch_to_table_df(spark: SparkSession, batch: List[Dict[str, Any]]):
 def _entities_batch_to_table_df(spark: SparkSession, batch: List[Dict[str, Any]]):
     raw_df = _json_batch_to_df(spark, batch)
     return _select_columns(raw_df, ENTITIES_TABLE_COLUMNS)
+
+
+def fetch_site_border_points(site_nr: Union[int, str]) -> List[Tuple[str, int, Optional[float], Optional[float]]]:
+    try:
+        points = BORDER_CLIENT.fetch_site_border_points(site_nr)
+    except requests.HTTPError as exc:
+        print(f"Unable to fetch border points for site {site_nr}: {exc}")
+        return []
+
+    rows: List[Tuple[str, int, Optional[float], Optional[float]]] = []
+    site_identifier = str(site_nr)
+    for idx, (latitude, longitude) in enumerate(points):
+        lat_value = float(latitude) if latitude is not None else None
+        lon_value = float(longitude) if longitude is not None else None
+        rows.append((site_identifier, idx, lat_value, lon_value))
+    return rows
+
+
+def load_site_border_points_to_bronze(site_numbers: Iterable[Union[int, str]]) -> int:
+    rows: List[Tuple[str, int, Optional[float], Optional[float]]] = []
+    for site_nr in site_numbers:
+        rows.extend(fetch_site_border_points(site_nr))
+
+    if not rows:
+        return 0
+
+    spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
+    _ensure_bronze_schema()
+
+    df = spark.createDataFrame(
+        rows,
+        schema=["siteNr", "pointIndex", "latitude", "longitude"],
+    )
+    df = df.withColumn("ingestion_ts", F.current_timestamp())
+
+    (
+        df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(SITE_BORDER_POINTS_BRONZE_TABLE)
+    )
+
+    return df.count()
 
 
 def _write_batch_to_bronze(
@@ -395,23 +478,28 @@ if __name__ == "__main__":
         from IPython.display import display as ipy_display
         ipy_display(sites_preview.toPandas())
 
-    border_preview_rows: List[Tuple[Union[int, str], int, float, float]] = []
+    border_preview_df = None
     if "siteNr" in site_columns:
         site_numbers = [row["siteNr"] for row in sites_preview.select("siteNr").limit(5).collect()]
-        for site_nr in site_numbers:
-            try:
-                points = BORDER_CLIENT.fetch_site_border_points(site_nr)
-            except requests.HTTPError as exc:
-                print(f"Unable to fetch border points for site {site_nr}: {exc}")
-                continue
-            for idx, (latitude, longitude) in enumerate(points):
-                border_preview_rows.append((site_nr, idx, latitude, longitude))
-
-    if border_preview_rows:
-        border_preview_df = spark.createDataFrame(
-            border_preview_rows,
-            schema=["siteNr", "pointIndex", "latitude", "longitude"],
-        )
+        if site_numbers:
+            written_border_points = load_site_border_points_to_bronze(site_numbers)
+        else:
+            written_border_points = 0
+        if written_border_points:
+            print(
+                "Written border point rows "
+                f"→ {SITE_BORDER_POINTS_BRONZE_TABLE}: {written_border_points}"
+            )
+            border_preview_df = (
+                spark.table(SITE_BORDER_POINTS_BRONZE_TABLE)
+                .orderBy(F.col("siteNr"), F.col("pointIndex"))
+                .limit(25)
+            )
+        else:
+            print("No border points written for preview.")
+    else:
+        print("No site numbers available to fetch border points.")
+    if border_preview_df is not None:
         print("Previewing the first border points (limit 5 sites)")
         try:
             display(border_preview_df)
