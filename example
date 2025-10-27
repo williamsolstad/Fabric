@@ -275,14 +275,16 @@ if __name__ == "__main__":
     print(f"Previewing the first rows from {ENTITIES_BRONZE_TABLE} (total written: {total_entities})")
     entities_preview = spark.sql(f"""
         SELECT
-            get_json_object(payload, '$.entityNr')           AS entityNr,
-            get_json_object(payload, '$.entityNrId')         AS entityNrId,
-            get_json_object(payload, '$.name')               AS name,
-            get_json_object(payload, '$.zipCode')            AS zipCode,
-            get_json_object(payload, '$.countyName')         AS countyName,
+            get_json_object(payload, '$.id')                      AS entityId,
+            get_json_object(payload, '$.versionId')               AS versionId,
+            get_json_object(payload, '$.name')                    AS name,
+            get_json_object(payload, '$.typeName')                AS typeName,
+            get_json_object(payload, '$.openNr')                  AS openNr,
+            get_json_object(payload, '$.addresses[0].zipCode')    AS primaryZipCode,
+            get_json_object(payload, '$.addresses[0].countyName') AS primaryCountyName,
             ingestion_ts
         FROM {ENTITIES_BRONZE_TABLE}
-        ORDER BY entityNr
+        ORDER BY entityId
         LIMIT 25
     """)
 
