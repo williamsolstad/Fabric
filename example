@@ -20,6 +20,8 @@ from notebookutils import mssparkutils
 from pyspark.sql import Column, SparkSession, functions as F
 from pyspark.sql.utils import AnalysisException
 
+from pub_aqua_geo import SiteBorderClient
+
 # -----------------------
 # Configuration
 # -----------------------
@@ -59,6 +61,12 @@ def _build_session() -> requests.Session:
     return s
 
 SESSION = _build_session()
+BORDER_CLIENT = SiteBorderClient(
+    session=SESSION,
+    base_url=BASE_URL,
+    timeout=TIMEOUT,
+    parse_response=_parse_or_raise,
+)
 
 # -----------------------
 # Helpers
@@ -153,29 +161,6 @@ def iter_sites(page_size: int = 100, max_pages: Optional[int] = None, **filters)
         k += 1
 
 
-def fetch_site_borders(site_nr: Union[int, str]) -> List[Dict[str, Any]]:
-    """Fetch site border metadata (including latitude/longitude points)."""
-
-    url = f"{BASE_URL}/api/v1/sites/{site_nr}/borders"
-    resp = SESSION.get(url, timeout=TIMEOUT)
-    return _parse_or_raise(resp)
-
-
-def fetch_site_border_points(site_nr: Union[int, str]) -> List[Tuple[float, float]]:
-    """Return a flat list of ``(latitude, longitude)`` tuples for a site's borders."""
-
-    borders = fetch_site_borders(site_nr)
-    points: List[Tuple[float, float]] = []
-    for border in borders:
-        for point in border.get("points", []):
-            latitude = point.get("latitude")
-            longitude = point.get("longitude")
-            if latitude is None or longitude is None:
-                continue
-            points.append((latitude, longitude))
-    return points
-
-
 # -----------------------
 # Lakehouse helpers
 # -----------------------
@@ -256,7 +241,8 @@ SITES_TABLE_COLUMNS: List[Tuple[str, ColumnBuilder]] = [
             F.lit("JOINT"),
         ).otherwise(F.lit("SOLO")),
     ),
-    ("placement", _col("placementTypeValue")),
+    ("placement", _col("placement")),
+    ("placementType", _col("placementTypeValue")),
     ("water", _col("waterTypeValue")),
     ("municipalityCode", _col("placement.municipalityCode")),
     ("municipalityName", _col("placement.municipalityName")),
@@ -408,6 +394,32 @@ if __name__ == "__main__":
         import pandas as pd
         from IPython.display import display as ipy_display
         ipy_display(sites_preview.toPandas())
+
+    border_preview_rows: List[Tuple[Union[int, str], int, float, float]] = []
+    if "siteNr" in site_columns:
+        site_numbers = [row["siteNr"] for row in sites_preview.select("siteNr").limit(5).collect()]
+        for site_nr in site_numbers:
+            try:
+                points = BORDER_CLIENT.fetch_site_border_points(site_nr)
+            except requests.HTTPError as exc:
+                print(f"Unable to fetch border points for site {site_nr}: {exc}")
+                continue
+            for idx, (latitude, longitude) in enumerate(points):
+                border_preview_rows.append((site_nr, idx, latitude, longitude))
+
+    if border_preview_rows:
+        border_preview_df = spark.createDataFrame(
+            border_preview_rows,
+            schema=["siteNr", "pointIndex", "latitude", "longitude"],
+        )
+        print("Previewing the first border points (limit 5 sites)")
+        try:
+            display(border_preview_df)
+        except Exception:
+            import pandas as pd
+            from IPython.display import display as ipy_display
+
+            ipy_display(border_preview_df.toPandas())
 
     total_entities = load_entities_to_bronze()
     print(f"Previewing the first rows from {ENTITIES_BRONZE_TABLE} (total written: {total_entities})")
