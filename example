@@ -178,7 +178,7 @@ def _write_batch_to_bronze(batch: List[Dict[str, Any]], table_name: str) -> int:
 
     return df.count()
 
-def load_sites_to_bronze(page_size: int = 100, max_pages: Optional[int] = None, **filters) -> int:
+def load_sites_to_bronze(page_size: int = 100, max_pages: Optional[int] = 1, **filters) -> int:
     total = 0
     for k, batch in iter_sites(page_size=page_size, max_pages=max_pages, **filters):
         written = _write_batch_to_bronze(batch, SITES_BRONZE_TABLE)
@@ -235,7 +235,7 @@ def iter_entities(page_size: int = 100, max_pages: Optional[int] = None, **filte
             return
         k += 1
 
-def load_entities_to_bronze(page_size: int = 100, max_pages: Optional[int] = None, **filters) -> int:
+def load_entities_to_bronze(page_size: int = 100, max_pages: Optional[int] = 1, **filters) -> int:
     total = 0
     for k, batch in iter_entities(page_size=page_size, max_pages=max_pages, **filters):
         written = _write_batch_to_bronze(batch, ENTITIES_BRONZE_TABLE)
@@ -256,8 +256,6 @@ if __name__ == "__main__":
         SELECT
             get_json_object(payload, '$.siteNr')                 AS siteNr,
             get_json_object(payload, '$.name')                   AS name,
-            get_json_object(payload, '$.water')                  AS water,
-            get_json_object(payload, '$.productionAreaCode')     AS productionAreaCode,
             ingestion_ts
         FROM {SITES_BRONZE_TABLE}
         ORDER BY siteNr
