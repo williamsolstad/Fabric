@@ -1,1248 +1,475 @@
-Bronze Retrieve Xledger Dimensions
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
-import requests
+# -*- coding: utf-8 -*-
+"""
+Fiskeridirektoratet pub-aqua full fetcher (Python/PySpark)
+- Fetches all listed endpoints from https://api.fiskeridir.no/pub-aqua
+- Robust retries + parallel fan-out for detail endpoints
+- Writes JSONL dumps (always) and Parquet (if Spark is available)
+
+Author: You
+"""
+
+import os
+import sys
 import json
-import collections
-import pyarrow as pa
-import pyarrow.parquet as pq 
 import time
-from datetime import datetime
+import math
+import gzip
+import uuid
+import queue
+import shutil
+import threading
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from trident_token_library_wrapper import PyTridentTokenLibrary as tl
-StatementMeta(, 8622fa66-3041-4e08-b4ba-923e32a49835, 3, Finished, Available, Finished)
-Retrieve credentials from Azure Key Vault
+# ---------------------------
+# Optional: Spark bootstrap
+# ---------------------------
+USE_SPARK = True
+spark = None
+try:
+    from pyspark.sql import SparkSession
+    spark = SparkSession.builder.getOrCreate()
+except Exception:
+    USE_SPARK = False
+    spark = None
 
-key_vault_name = 'keyvault-Fabric-prod-rg'
+# ---------------------------
+# HTTP client with retries
+# ---------------------------
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-access_token = mssparkutils.credentials.getToken("keyvault")
+BASE_URL = "https://api.fiskeridir.no/pub-aqua"
+USER_AGENT = "pub-aqua-fetcher/1.0 (+for-powerbi)"
+TIMEOUT = (10, 60)  # (connect, read)
+MAX_RETRIES = 5
+BACKOFF_FACTOR = 1.5
+STATUS_FORCELIST = (429, 500, 502, 503, 504)
+ALLOWED_METHODS = frozenset(["GET"])
 
-# Xledger token
-key_name = "xledgerAPIToken" #Old token
-key_name = "xledgerAPITokenFarbic" #New token
+def build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=MAX_RETRIES,
+        read=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=STATUS_FORCELIST,
+        allowed_methods=ALLOWED_METHODS,
+        raise_on_status=False,
+        respect_retry_after_header=True
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+    s.mount("https://", adapter)
+    s.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "application/json"
+    })
+    return s
 
-token = tl.get_secret_with_token(
-    f"https://{key_vault_name}.vault.azure.net/",
-    key_name,
-    access_token
-)
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 5, Finished, Available, Finished)
-Authentication
+SESSION = build_session()
 
-api_url = "https://www.xledger.net/graphql"
-
-# Define headers
-headers = {
-    "Authorization": f"token {token}",
-    "Content-Type": "application/json"
-}
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 6, Finished, Available, Finished)
-Functions
-
-def fetch_all_data(api_url, headers, query, root_field):
-    all_data = []
-    has_next_page = True
-    after = None
-
-    while has_next_page:
-        query_payload = {
-            "query": query,
-            "variables": {"after": after}
-        }
-        
-        while True:
-            # Make the request
-            response = requests.post(url=api_url, headers=headers, data=json.dumps(query_payload))
-
-            if response.status_code == 200:
-                result = response.json()
-                if 'errors' in result:
-                    # Check for insufficient credits error
-                    if any(error['code'] == 'BAD_REQUEST.INSUFFICIENT_CREDITS' for error in result['errors']):
-                        # Extract reset time from the error message
-                        reset_at = datetime.fromisoformat(result['errors'][0]['extensions']['resetAt'].replace('Z', '+00:00'))
-                        reset_at = reset_at.replace(tzinfo=None)  # Make reset_at offset-naive
-                        wait_time = (reset_at - datetime.utcnow()).total_seconds()
-                        print(f"Insufficient credits. Waiting for {wait_time} seconds until credits reset...")
-                        time.sleep(wait_time + 120)  # Wait 2 minutes until the credits reset
-                        continue  # Retry the request after waiting
-                    else:
-                        print(result)
-                        return all_data  # Return collected data for other errors
-                else:
-                    result_str = json.dumps(result, indent=2)
-                    result_lines = result_str.split('\n')
-                    
-                    data = result['data'][root_field]
-
-                    # Append the data to the list
-                    all_data.extend([edge['node'] for edge in data['edges']])
-                    
-                    # Check if there is a next page
-                    has_next_page = data['pageInfo']['hasNextPage']
-                    
-                    # Update the cursor for the next request
-                    if has_next_page:
-                        after = data['edges'][-1]['cursor']
-                    break  # Exit the inner while loop to proceed to the next page
-            else:
-                print(f"Request failed with status code {response.status_code}")
-                return all_data  # Return collected data if request fails
-
-    return all_data
-
-
-def custom_flatten(d: dict, parent_key: str = '', sep: str = '_', prefix_to_strip: str = None):
+def GET(path: str, params: Optional[Dict[str, Any]] = None) -> Any:
     """
-    Flattens a nested dictionary and concatenates the names of the parent
-    and child names of nested dictionaries with a customizable separator.
-    Returns the flattened dictionary.
+    GET helper that returns parsed JSON or raises for hard failures.
     """
-    items = []
-    for k, v in d.items():
-        if prefix_to_strip:
-            if parent_key:
-                concat_key = parent_key + sep + k
-            new_key = re.sub(r'^{}'.format(prefix_to_strip), '', concat_key) if parent_key else k
-        else:
-            new_key = (parent_key + sep + k) if parent_key else k
-        if isinstance(v, collections.abc.MutableMapping):
-            items.extend(custom_flatten(v, new_key, sep=sep, prefix_to_strip=prefix_to_strip).items())
-        else:
-            items.append((new_key, v))
+    url = f"{BASE_URL}{path}"
+    r = SESSION.get(url, params=params or {}, timeout=TIMEOUT)
+    # Handle unexpected non-JSON gracefully
+    ctype = r.headers.get("Content-Type", "")
+    if r.status_code >= 400:
+        # Let 404 on child endpoints be soft-handled by caller if needed
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+    if "application/json" not in ctype:
+        # Try to parse anyway; if not, return raw text
+        try:
+            return r.json()
+        except Exception:
+            return r.text
+    return r.json()
 
-    return dict(items)
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 7, Finished, Available, Finished)
-Dimensions
-DimAccounts
+# ---------------------------
+# Utilities
+# ---------------------------
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
-# GraphQL query to fetch data from DimAccounts
-query_accounts = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  accounts(first: 10000, after: $after, objectStatus: ALL, ownerSet: MINE) {
-    edges {
-      cursor
-      node {
-        dbId
-        code
-        description
-        accountGroupDbId
-        accountGroup {
-          id
-          description
-          dbId
-          dbSubId
-          definitionId
-        }
-        accountIndicator {
-          code
-          dbId
-          dbSubId
-          definitionId
-          name
-          ownerDbId
-        }
-        sysAccount {
-          dbId
-          description
-          id
-        }
-        ownerDbId
-        asset
-        revenue
-        posting
-        chartOfAccount {
-          name
-        }
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data using the function
-all_data = fetch_all_data(api_url, headers, query_accounts, 'accounts')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_accounts = spark.createDataFrame(str_data)
-
-print("num rows:", df_accounts.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 8, Finished, Available, Finished)
-num rows: 6055
-output_path = "xl_accounts"
-
-df_accounts.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 9, Finished, Available, Finished)
-DimEntities
-
-# GraphQL query to fetch data from DimEntities
-query_entities = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  entities(first: 10000, after: $after, ownerSet: MINE, filter: {}) {
-    edges {
-      cursor
-      node {
-        dbId
-        description
-        flexiFieldSetupEntries {
-          code4Object {
-            code
-            description
-          }
-          code3Object {
-            code
-            description
-          }
-          code2Object {
-            code
-            description
-          }
-          code1Object {
-            code
-            description
-          }
-          owner {
-            code
-          }
-        }
-        code
-        hierarchySort
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_entities, 'entities')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_entities = spark.createDataFrame(str_data)
-
-print(df_entities.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 10, Finished, Available, Finished)
-21
-output_path = "xl_entities"
-
-df_entities.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 11, Finished, Available, Finished)
-JournalHeaders
-
-# GraphQL query to fetch data from journalHeaders
-query_journals = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  journalHeaders(first: 10000, after: $after, ownerSet: MINE, filter: {}) {
-    edges {
-      cursor
-      node {
-        dbId
-        archive
-        importedAt
-        createdAt
-        postedDate
-        invoiceFile {
-          dbId
-        }
-        trProcessAction {
-          dbId
-        }
-        transactionNumber
-        period {
-          dbId
-        }
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_journals, 'journalHeaders')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_journals = spark.createDataFrame(str_data)
-
-print(df_journals.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 12, Finished, Available, Finished)
-44174
-output_path = "xl_journals"
-df_journals.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 13, Finished, Available, Finished)
-Company
-
-# GraphQL query to fetch data 
-query_companies = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  companies(first: 10000, after: $after, ownerSet: MINE, filter: {}) {
-    edges {
-      node {
-        dbId
-        ownerDbId
-        companyNumber
-        contact {
-          companyContact
-          companyName
-          dbId
-          companyPerson
-          code
-          id
-        }
-        country
-      }
-      cursor
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_companies, 'companies')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_companies = spark.createDataFrame(str_data)
-
-print(df_companies.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 14, Finished, Available, Finished)
-506929
-output_path = "xl_companies"
-df_companies.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 15, Finished, Available, Finished)
-Customers
-
-# GraphQL query to fetch data from customers
-query_customers = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  customers(first: 10000, after: $after, objectStatus: ALL, ownerSet: MINE, filter: {}) {
-    edges {
-      cursor
-      node {
-        dbId
-        companyDbId
-        code
-        ownerDbId
-        id
-        createdAt
-        description
-        invoiceNumber
-        number
-        taxNo
-        address {
-          place
-          streetAddress
-          streetNumber
-          zipCode
-          createdAt
-        }
-        billAddress {
-          place
-          streetAddress
-          streetNumber
-          zipCode
-          createdAt
-        }
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_customers, 'customers')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_customers = spark.createDataFrame(str_data)
-
-print(df_customers.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 16, Finished, Available, Finished)
-200
-output_path = "xl_customers"
-df_customers.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 17, Finished, Available, Finished)
-Projects
-
-# GraphQL query to fetch data from projects
-query_projects = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  projects(first: 10000, after: $after, ownerSet: MINE, filter: {}) {
-    edges {
-      cursor
-      node {
-        dbId
-        projectType {
-          id
-          description
-        }
-        projectGroup {
-          levelParent {
-            code
-            description
-            code2 {
-              code
-            }
-            code3 {
-              code
-            }
-            code4 {
-              code
-            }
-          }
-        }
-        totalEstimateHours
-        totalRevenue
-        totalCost
-        yearlyEstimateHours
-        yearlyCost
-        yearlyRevenue
-        contract
-        contractedRevenue
-        expenseLedger
-        code
-        description
-        activity
-        extIdentifier
-        invoiceFooter
-        invoiceHeader
-        mainProjectDbId
-        ownerDbId
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_projects, 'projects')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_projects = spark.createDataFrame(str_data)
-
-print(df_projects.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 18, Finished, Available, Finished)
-174
-output_path = "xl_projects"
-df_projects.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 19, Finished, Available, Finished)
-Suppliers
-
-# GraphQL query to fetch data from projects
-query_suppliers = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  suppliers(first: 10000, after: $after, ownerSet: MINE, filter: {}) {
-    edges {
-      cursor
-      node {
-        dbId
-        companyDbId
-        id
-        code
-        description
-        email
-        contract
-        createdAt
-        address {
-          place
-          streetAddress
-          zipCode
-        }
-        billAddress {
-          place
-          streetAddress
-          zipCode
-        }
-        taxNo
-        htmlEmail
-        phone
-        number
-        ownerDbId
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_suppliers, 'suppliers')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_suppliers = spark.createDataFrame(str_data)
-
-print(df_suppliers.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 20, Finished, Available, Finished)
-1849
-output_path = "xl_suppliers"
-df_suppliers.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 21, Finished, Available, Finished)
-Products
-
-# GraphQL query to fetch data from projects
-query_products = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  products(first: 10000, after: $after, ownerSet: MINE, filter: {}) {
-    edges {
-      cursor
-      node {
-        dbId
-        description
-        code
-        averagePrice
-        salesPrice
-        costPrice
-        currency {
-          code
-          dbId
-          description
-        }
-        dateLimit
-        exchangeRate
-        expenses
-        forSale
-        inStock
-        internalInfo
-        location
-        lotNo
-        model
-        partNo
-        productGroup {
-          description
-        }
-        productGroupDbId
-        purchase
-        serialNo
-        supplier
-        unit
-        volume
-        weight
-        warehouse
-        glObject1 {
-          dbId
-          code
-          objectKindDbId
-          ownerDbId
-          id
-        }
-        glObject2 {
-          dbId
-          code
-          objectKindDbId
-          ownerDbId
-          id
-        }
-        glObject3 {
-          dbId
-        }
-        glObject4 {
-          dbId
-        }
-        glObject5 {
-          dbId
-        }
-        ownerDbId
-        createdAt
-        modifiedAt
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_products, 'products')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_products = spark.createDataFrame(str_data)
-
-print(df_products.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 22, Finished, Available, Finished)
-26
-output_path = "xl_products"
-df_products.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 23, Finished, Available, Finished)
-GL Objects
-
-query_objectKinds = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  objectKinds(first: 10000, after: $after, filter: {}) {
-    edges {
-      node {
-        dbId
-        name
-      }
-      cursor
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_objectKinds, 'objectKinds')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_objectKinds = spark.createDataFrame(str_data)
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 24, Finished, Available, Finished)
-output_path = "xl_objectKinds"
-df_objectKinds.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 25, Finished, Available, Finished)
-def fetch_all_data(api_url, headers, query, root_field):
-    all_data = []
-    has_next_page = True
-    after = None
-
-    while has_next_page:
-        query_payload = {
-            "query": query,
-            "variables": {"after": after}
-        }
-        
-        while True:
-            # Make the request
-            response = requests.post(url=api_url, headers=headers, data=json.dumps(query_payload))
-
-            if response.status_code == 200:
-                result = response.json()
-                print("hei")
-                print(result)
-                if 'errors' in result:
-                    # Check for insufficient credits error
-                    if any(error['code'] == 'BAD_REQUEST.INSUFFICIENT_CREDITS' for error in result['errors']):
-                        reset_at = datetime.fromisoformat(result['errors'][0]['extensions']['resetAt'].replace('Z', '+00:00'))
-                        reset_at = reset_at.replace(tzinfo=None)
-                        wait_time = (reset_at - datetime.utcnow()).total_seconds()
-                        print(f"Insufficient credits. Waiting for {wait_time} seconds until credits reset...")
-                        time.sleep(wait_time + 120)
-                        continue
-                    else:
-                        print(result)
-                        return all_data
-                else:
-                    data = result['data'][root_field]
-
-                    if data is None:
-                        print(f"'{root_field}' is None. No data found for this query.")
-                        return all_data
-
-                    edges = data.get('edges')
-                    if not edges:
-                        print(f"No edges found for '{root_field}'. No data available.")
-                        return all_data
-
-                    # Log edges for debugging
-                    print(f"Edges: {json.dumps(edges, indent=2)}")
-
-                    # Process edges and filter valid nodes
-                    valid_nodes = []
-                    for edge in edges:
-                        node = edge.get('node')
-                        if node is None:
-                            print(f"Skipping edge with None node: {edge}")
-                            continue
-                        valid_nodes.append(node)
-
-                    if not valid_nodes:
-                        print(f"All nodes in edges are None for '{root_field}'. No valid data available.")
-                        return all_data
-
-                    all_data.extend(valid_nodes)
-                    print(f"Number of valid nodes fetched so far: {len(all_data)}")
-
-                    # Check if there is a next page
-                    has_next_page = data['pageInfo']['hasNextPage']
-                    print(f"Has next page: {has_next_page}")
-
-                    # Update the cursor for the next request
-                    if has_next_page:
-                        after = edges[-1]['cursor']
-                        print(f"Next cursor: {after}")
-                    break
-            else:
-                print(f"Request failed with status code {response.status_code}")
-                return all_data
-
-    return all_data
-StatementMeta(, 876f053e-c58b-4a97-ac59-19ace88818d0, 47, Finished, Available, Finished)
-# List of objectKind dbIds to query
-dbIds = [3, 30, 31, 131]
-#dbIds = [31]
-#dbIds = [30,131]
-all_data = []
-missing_data_dbIds = []  # List for dbIds with no return data
-
-
-for dbId in dbIds:
-    query = f"""
-    query ($after: String) {{
-      rateLimit {{
-          cost
-          limit
-          resetAt
-          remaining
-      }}
-      objectValues(first: 10000, after: $after, ownerSet: MINE, filter: {{ objectKindDbId: {dbId} }}) {{
-        edges {{
-          cursor
-          node {{
-            dbId
-            id
-            description
-            code
-            posting
-            objectKind {{
-              dbId
-              name
-            }}
-            levelParent {{
-              levelParent {{
-                levelParent {{
-                  code
-                  description
-                  objectKind {{
-                    dbId
-                    name
-                  }}
-                }}
-                code
-                description
-                objectKind {{
-                  dbId
-                  name
-                }}
-              }}
-              code
-              description
-              objectKind {{
-                dbId
-                name
-              }}
-            }}
-          }}
-        }}
-        pageInfo {{
-          hasNextPage
-        }}
-      }}
-    }}
+def jsonl_dump(records: Iterable[Dict[str, Any]], out_path: str) -> int:
     """
-    # Fetch data for the current dbId
-    data = fetch_all_data(api_url, headers, query, 'objectValues')
-    #all_data.extend(data)
+    Writes iterable of dicts to JSONL. Returns count written.
+    """
+    ensure_dir(os.path.dirname(out_path))
+    n = 0
+    with open(out_path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            n += 1
+    return n
 
-    if not data:  # Hvis ingen data ble funnet for denne dbId
-        missing_data_dbIds.append(dbId)  # Legg til i listen over manglende data
+def to_spark(df_name: str, rows: List[Dict[str, Any]], out_dir: str) -> Optional[int]:
+    """
+    Creates a Spark DataFrame from list of dicts and writes as Parquet.
+    Returns row count if Spark is available.
+    """
+    if not USE_SPARK or spark is None:
+        return None
+    if not rows:
+        # Create an empty DF with a placeholder schema to maintain table presence
+        sdf = spark.createDataFrame([], schema="placeholder string")
     else:
-        all_data.extend(data)  # Legg til data i all_data
+        sdf = spark.createDataFrame(rows)
+    path = os.path.join(out_dir, df_name)
+    ensure_dir(path)
+    sdf.write.mode("overwrite").parquet(path)
+    return sdf.count()
 
-# Logg hvilke dbIds som ikke returnerte data
-if missing_data_dbIds:
-    print(f"The following dbIds returned no data: {missing_data_dbIds}")
-else:
-    print("All dbIds returned data.")
+def detect_first_key(d: Dict[str, Any], candidates: List[str]) -> Optional[str]:
+    for k in candidates:
+        if k in d:
+            return k
+    return None
 
-# Convert to string format for DataFrame
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
+def extract_id(record: Dict[str, Any], candidates: List[str]) -> Optional[Any]:
+    key = detect_first_key(record, candidates)
+    return record.get(key) if key else None
 
-# Create DataFrame
-df_objectValues = spark.createDataFrame(str_data)
+def parallel_map(func, items: List[Any], max_workers: int = 16, desc: str = "") -> List[Any]:
+    out: List[Any] = [None] * len(items)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(func, idx, item): idx for idx, item in enumerate(items)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                out[idx] = fut.result()
+            except Exception as e:
+                print(f"[WARN] {desc} item {idx} failed: {e}", file=sys.stderr)
+                out[idx] = None
+    return out
 
-print(df_objectValues.count())
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 26, Finished, Available, Finished)
-All dbIds returned data.
-613
-output_path = "xl_objectValues"
-df_objectValues.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 27, Finished, Available, Finished)
-BudgetBalances
+# ---------------------------
+# Fetchers for each domain
+# ---------------------------
 
-query_budgetBalances = """
-query ($after: String) {
-  rateLimit {
-    cost
-    limit
-    resetAt
-    remaining
-  }
-  budgetBalances(first: 10000, ownerSet: MINE, after: $after) {
-    edges {
-      node {
-        budget {
-          code
-          dbId
-          description
-          definitionId
-          levelParent {
-            code
-            dbId
-            levelParent {
-              code
-              dbId
-            }
-          }
-          modifiedAt
-          objectKind {
-            dbId
-            name
-          }
-          ownerDbId
-        }
-        accountDbId
-        amount
-        amount3
-        amount4
-        amount5
-        budgetDbId
-        glObject1 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject2 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject3 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject4 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject5 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        company {
-          dbId
-        }
-        dbId
-        period {
-          fiscalPeriod
-          fiscalYear
-        }
-        quantity
-      }
-      cursor
+def fetch_sites_list() -> List[Dict[str, Any]]:
+    # GET /api/v1/sites
+    data = GET("/api/v1/sites")
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    # Unknown shape; coerce into list
+    return [data] if data else []
+
+def fetch_site_detail(site_nr: Any) -> Dict[str, Any]:
+    # GET /api/v1/sites/{site-nr}
+    d = GET(f"/api/v1/sites/{site_nr}") or {}
+    d["site_nr"] = site_nr
+    return d
+
+def fetch_site_license_connections(site_nr: Any) -> List[Dict[str, Any]]:
+    # GET /api/v1/sites/{site-nr}/license-connections
+    data = GET(f"/api/v1/sites/{site_nr}/license-connections")
+    rows = data if isinstance(data, list) else (data or [])
+    for r in rows:
+        r["site_nr"] = site_nr
+    return rows
+
+def fetch_site_decisions(site_nr: Any) -> List[Dict[str, Any]]:
+    # GET /api/v1/sites/{site-nr}/decisions
+    data = GET(f"/api/v1/sites/{site_nr}/decisions")
+    rows = data if isinstance(data, list) else (data or [])
+    for r in rows:
+        r["site_nr"] = site_nr
+    return rows
+
+def fetch_site_borders(site_nr: Any) -> Dict[str, Any]:
+    # GET /api/v1/sites/{site-nr}/borders
+    data = GET(f"/api/v1/sites/{site_nr}/borders") or {}
+    # Some APIs return GeoJSON FeatureCollection | Feature
+    return {"site_nr": site_nr, "borders": data}
+
+def fetch_licenses_list() -> List[Dict[str, Any]]:
+    data = GET("/api/v1/licenses")
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    return [data] if data else []
+
+def fetch_licenses_overview_list() -> List[Dict[str, Any]]:
+    data = GET("/api/v1/licenses-overview")
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    return [data] if data else []
+
+def fetch_license_detail(license_nr: Any) -> Dict[str, Any]:
+    data = GET(f"/api/v1/licenses/{license_nr}") or {}
+    data["license_nr"] = license_nr
+    return data
+
+def fetch_license_capacity_history(license_nr: Any) -> List[Dict[str, Any]]:
+    data = GET(f"/api/v1/licenses/{license_nr}/capacity-history")
+    rows = data if isinstance(data, list) else (data or [])
+    for r in rows:
+        r["license_nr"] = license_nr
+    return rows
+
+def fetch_license_site_connections(license_nr: Any) -> List[Dict[str, Any]]:
+    data = GET(f"/api/v1/licenses/{license_nr}/site-connections")
+    rows = data if isinstance(data, list) else (data or [])
+    for r in rows:
+        r["license_nr"] = license_nr
+    return rows
+
+def fetch_license_types_intentions() -> List[Dict[str, Any]]:
+    data = GET("/api/v1/license-types/intentions")
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    return [data] if data else []
+
+def fetch_entities_list() -> List[Dict[str, Any]]:
+    data = GET("/api/v1/entities")
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    return [data] if data else []
+
+def fetch_entity_detail(entity_id: Any) -> Dict[str, Any]:
+    data = GET(f"/api/v1/entities/{entity_id}") or {}
+    data["entity_id"] = entity_id
+    return data
+
+def fetch_entity_sites_by_id(entity_id: Any) -> List[Dict[str, Any]]:
+    data = GET(f"/api/v1/entities/{entity_id}/sites")
+    rows = data if isinstance(data, list) else (data or [])
+    for r in rows:
+        r["entity_id"] = entity_id
+    return rows
+
+def fetch_entity_sites_by_entity_nr(entity_nr: Any) -> List[Dict[str, Any]]:
+    data = GET(f"/api/v1/entities/sites-by-entity-nr/{entity_nr}")
+    rows = data if isinstance(data, list) else (data or [])
+    for r in rows:
+        r["entity_nr"] = entity_nr
+    return rows
+
+def fetch_areas_list() -> List[Dict[str, Any]]:
+    data = GET("/api/v1/areas")
+    if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    return [data] if data else []
+
+def fetch_area_detail(area_type: str, code: str) -> Dict[str, Any]:
+    data = GET(f"/api/v1/areas/{area_type}/{code}") or {}
+    data["area_type"] = area_type
+    data["code"] = code
+    return data
+
+# ---------------------------
+# Orchestration
+# ---------------------------
+
+def main(output_root: str = "./pub_aqua_out", max_workers: int = 16) -> None:
+    ensure_dir(output_root)
+
+    # 1) Sites and children
+    print("Fetching sites list …")
+    sites = fetch_sites_list()
+    print(f"Sites: {len(sites)}")
+
+    # Detect site id key
+    site_id_key = None
+    if sites:
+        site_id_key = detect_first_key(
+            sites[0],
+            ["siteNr", "site-nr", "siteNumber", "site_no", "localityNo", "lokalitetsnummer"]
+        ) or "siteNr"
+    print(f"Detected site id key: {site_id_key}")
+
+    site_ids = [extract_id(x, [site_id_key]) for x in sites if extract_id(x, [site_id_key]) is not None]
+
+    # Fan-out: site details
+    print("Fetching site details …")
+    site_details = [x for x in parallel_map(lambda i, s: fetch_site_detail(s), site_ids, max_workers, desc="site-detail") if x]
+
+    print("Fetching site license connections …")
+    site_license_conns_all: List[Dict[str, Any]] = []
+    for chunk_idx, chunk in enumerate([site_ids[i:i+200] for i in range(0, len(site_ids), 200)]):
+        res = parallel_map(lambda i, s: fetch_site_license_connections(s), chunk, max_workers, desc=f"site-license-conns-{chunk_idx}")
+        for r in res:
+            if r:
+                site_license_conns_all.extend(r)
+
+    print("Fetching site decisions …")
+    site_decisions_all: List[Dict[str, Any]] = []
+    for chunk_idx, chunk in enumerate([site_ids[i:i+200] for i in range(0, len(site_ids), 200)]):
+        res = parallel_map(lambda i, s: fetch_site_decisions(s), chunk, max_workers, desc=f"site-decisions-{chunk_idx}")
+        for r in res:
+            if r:
+                site_decisions_all.extend(r)
+
+    print("Fetching site borders (geometry) …")
+    site_borders = [x for x in parallel_map(lambda i, s: fetch_site_borders(s), site_ids, max_workers, desc="site-borders") if x]
+
+    # 2) Licenses and children
+    print("Fetching licenses list …")
+    licenses = fetch_licenses_list()
+    print(f"Licenses: {len(licenses)}")
+
+    print("Fetching licenses overview list …")
+    licenses_overview = fetch_licenses_overview_list()
+    print(f"Licenses overview: {len(licenses_overview)}")
+
+    license_id_key = None
+    if licenses:
+        license_id_key = detect_first_key(
+            licenses[0],
+            ["licenseNr", "license-nr", "licenseNumber", "licensenr", "l_n"]
+        ) or "licenseNr"
+    print(f"Detected license id key: {license_id_key}")
+
+    license_ids = [extract_id(x, [license_id_key]) for x in licenses if extract_id(x, [license_id_key]) is not None]
+
+    print("Fetching license details …")
+    license_details = [x for x in parallel_map(lambda i, l: fetch_license_detail(l), license_ids, max_workers, desc="license-detail") if x]
+
+    print("Fetching license capacity history …")
+    license_capacity_hist_all: List[Dict[str, Any]] = []
+    for chunk_idx, chunk in enumerate([license_ids[i:i+200] for i in range(0, len(license_ids), 200)]):
+        res = parallel_map(lambda i, l: fetch_license_capacity_history(l), chunk, max_workers, desc=f"license-capacity-{chunk_idx}")
+        for r in res:
+            if r:
+                license_capacity_hist_all.extend(r)
+
+    print("Fetching license site-connections …")
+    license_site_conns_all: List[Dict[str, Any]] = []
+    for chunk_idx, chunk in enumerate([license_ids[i:i+200] for i in range(0, len(license_ids), 200)]):
+        res = parallel_map(lambda i, l: fetch_license_site_connections(l), chunk, max_workers, desc=f"license-site-conns-{chunk_idx}")
+        for r in res:
+            if r:
+                license_site_conns_all.extend(r)
+
+    print("Fetching license types intentions …")
+    license_types_intentions = fetch_license_types_intentions()
+
+    # 3) Entities and children
+    print("Fetching entities list …")
+    entities = fetch_entities_list()
+    print(f"Entities: {len(entities)}")
+
+    entity_id_key = None
+    entity_nr_key = None
+    if entities:
+        entity_id_key = detect_first_key(entities[0], ["id", "entityId"]) or "id"
+        entity_nr_key = detect_first_key(entities[0], ["entityNr", "entity-nr", "entityNumber", "orgnr"]) or "entityNr"
+    print(f"Detected entity id key: {entity_id_key}, entity nr key: {entity_nr_key}")
+
+    entity_ids = [extract_id(x, [entity_id_key]) for x in entities if extract_id(x, [entity_id_key]) is not None]
+    entity_nrs = [extract_id(x, [entity_nr_key]) for x in entities if extract_id(x, [entity_nr_key]) is not None]
+
+    print("Fetching entity details …")
+    entity_details = [x for x in parallel_map(lambda i, e: fetch_entity_detail(e), entity_ids, max_workers, desc="entity-detail") if x]
+
+    print("Fetching entity sites by entity id …")
+    entity_sites_by_id_all: List[Dict[str, Any]] = []
+    for chunk_idx, chunk in enumerate([entity_ids[i:i+200] for i in range(0, len(entity_ids), 200)]):
+        res = parallel_map(lambda i, e: fetch_entity_sites_by_id(e), chunk, max_workers, desc=f"entity-sites-id-{chunk_idx}")
+        for r in res:
+            if r:
+                entity_sites_by_id_all.extend(r)
+
+    print("Fetching entity sites by entity nr …")
+    entity_sites_by_nr_all: List[Dict[str, Any]] = []
+    for chunk_idx, chunk in enumerate([entity_nrs[i:i+200] for i in range(0, len(entity_nrs), 200)]):
+        res = parallel_map(lambda i, en: fetch_entity_sites_by_entity_nr(en), chunk, max_workers, desc=f"entity-sites-nr-{chunk_idx}")
+        for r in res:
+            if r:
+                entity_sites_by_nr_all.extend(r)
+
+    # 4) Areas and details
+    print("Fetching areas list …")
+    areas = fetch_areas_list()
+    print(f"Areas entries: {len(areas)}")
+
+    # Area item might have different keys; try to detect
+    area_type_key = None
+    area_code_key = None
+    if areas:
+        area_type_key = detect_first_key(areas[0], ["type", "areaType", "kategori"]) or "type"
+        area_code_key = detect_first_key(areas[0], ["code", "areaCode", "kode"]) or "code"
+    print(f"Detected area keys -> type: {area_type_key}, code: {area_code_key}")
+
+    dedup_area_pairs = []
+    for a in areas:
+        t = a.get(area_type_key)
+        c = a.get(area_code_key)
+        if t is not None and c is not None:
+            dedup_area_pairs.append((str(t), str(c)))
+    dedup_area_pairs = sorted(list(set(dedup_area_pairs)))
+
+    print("Fetching area details …")
+    area_details = [x for x in parallel_map(lambda i, tc: fetch_area_detail(tc[0], tc[1]), dedup_area_pairs, max_workers, desc="area-detail") if x]
+
+    # ---------------------------
+    # Persist: JSONL (raw) + Spark Parquet (curated)
+    # ---------------------------
+    raw_dir = os.path.join(output_root, "raw_jsonl")
+    curated_dir = os.path.join(output_root, "parquet")
+
+    tables = {
+        "sites": sites,
+        "site_details": site_details,
+        "site_license_connections": site_license_conns_all,
+        "site_decisions": site_decisions_all,
+        "site_borders": site_borders,
+
+        "licenses": licenses,
+        "licenses_overview": licenses_overview,
+        "license_details": license_details,
+        "license_capacity_history": license_capacity_hist_all,
+        "license_site_connections": license_site_conns_all,
+        "license_types_intentions": license_types_intentions,
+
+        "entities": entities,
+        "entity_details": entity_details,
+        "entity_sites_by_id": entity_sites_by_id_all,
+        "entity_sites_by_entity_nr": entity_sites_by_nr_all,
+
+        "areas": areas,
+        "area_details": area_details,
     }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_budgetBalances, 'budgetBalances')
 
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
+    print("\nWriting JSONL dumps …")
+    for name, rows in tables.items():
+        out_path = os.path.join(raw_dir, f"{name}.jsonl")
+        cnt = jsonl_dump(rows, out_path)
+        print(f"  - {name:<30} {cnt:>8} rows -> {out_path}")
 
-df_budgetBalances = spark.createDataFrame(str_data)
-
-print(df_budgetBalances.count())
-#display(df_budgetBalances)
-
-output_path = "xl_budgetBalances"
-df_budgetBalances.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-
-from pyspark.sql.functions import col, sum as _sum
-
-# Convert 'amount' to float and calculate the sum
-df_budgetBalances = df_budgetBalances.withColumn("amount", col("amount").cast("float"))
-amount_sum = df_budgetBalances.agg(_sum("amount")).collect()[0][0]
-
-print(f"Total sum of amounts: {amount_sum}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 28, Finished, Available, Finished)
-113
-Total sum of amounts: -3007558361716694.0
-BudgetDetails
-
-query_budgetDetails = """
-query ($after: String) {
-  rateLimit {
-      cost
-      limit
-      resetAt
-      remaining
-  }
-  budgetDetails (first: 10000, after: $after, ownerSet: MINE, filter: {}) {
-    edges {
-      cursor
-      node {
-        amount
-        amount3
-        amount4
-        amount5
-        account {
-          dbId
-        }
-        budgetDbId
-        budget {
-          code
-          dbId
-          description
-          levelParent {
-            code
-            dbId
-            levelParent {
-              code
-              dbId
-              levelParent {
-                code
-                dbId
-              }
-            }
-          }
-          objectKind {
-            dbId
-            name
-          }
-          ownerDbId
-        }
-        glObject1 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject2 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject3 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject4 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        glObject5 {
-          dbId
-          code
-          description
-          ownerDbId
-          owner {
-            description
-          }
-          levelParent {
-            dbId
-          }
-          objectKind {
-            dbId
-            name
-          }
-        }
-        company {
-          dbId
-        }
-        dbId
-        period {
-          fiscalPeriod
-          fiscalYear
-        }
-      }
-    }
-    pageInfo {
-      hasNextPage
-    }
-  }
-}
-"""
-# Fetch all data 
-all_data = fetch_all_data(api_url, headers, query_budgetDetails, 'budgetDetails')
-
-str_data = [{k: str(v) for k, v in row.items()} for row in all_data]
-
-df_budgetDetails = spark.createDataFrame(str_data)
-
-print(df_budgetDetails.count())
-#display(df_budgetDetails)
-
-output_path = "xl_budgetDetails"
-df_budgetDetails.write.mode("overwrite").option("mergeSchema", "true").format("parquet").save(f"Files/{output_path}")
-
-from pyspark.sql.functions import col, sum as _sum
-
-# Convert 'amount' to float and calculate the sum
-df_budgetDetails = df_budgetDetails.withColumn("amount", col("amount").cast("float"))
-amount_sum = df_budgetDetails.agg(_sum("amount")).collect()[0][0]
-
-print(f"Total sum of amounts: {amount_sum}")
-StatementMeta(, 8d85b833-eeb9-4366-9975-73cc15212d4a, 29, Finished, Available, Finished)
-339
-Total sum of amounts: -6015116738675222.0
-Introspection
-
-# GraphQL introspection query to fetch schema information for the 'Account' type
-introspection_query = """
-{
-  __type(name: "Account") {
-    name
-    fields {
-      name
-      type {
-        name
-        kind
-        ofType {
-          name
-          kind
-        }
-      }
-    }
-  }
-}
-"""
-
-# Function to fetch schema information
-def fetch_schema(api_url, headers, query):
-    response = requests.post(api_url, json={'query': query}, headers=headers)
-    if response.status_code == 200:
-        return response.json()
+    if USE_SPARK and spark is not None:
+        print("\nWriting Parquet tables (Spark) …")
+        for name, rows in tables.items():
+            try:
+                n = to_spark(name, rows, curated_dir)
+                print(f"  - {name:<30} {n if n is not None else 0:>8} rows -> {os.path.join(curated_dir, name)}")
+            except Exception as e:
+                print(f"[WARN] Spark write failed for {name}: {e}", file=sys.stderr)
     else:
-        raise Exception(f"Query failed with status code {response.status_code}: {response.text}")
+        print("\n[INFO] Spark not available; skipped Parquet writes. JSONL files are ready.")
 
-# Fetch schema information
-schema_info = fetch_schema(api_url, headers, introspection_query)
+    print("\nDone.")
 
-# Print schema information
-fields = schema_info['data']['__type']['fields']
-for field in fields:
-    print(f"Field name: {field['name']}, Type: {field['type']['name'] or field['type']['ofType']['name']}")
-
-
-# Recursive function to print field information
-def print_fields(fields, indent=0):
-    for field in fields:
-        field_type = field['type']
-        field_name = field['name']
-        field_kind = field_type['kind']
-        field_type_name = field_type['name'] or (field_type['ofType']['name'] if field_type['ofType'] else None)
-        
-        print("  " * indent + f"Field name: {field_name}, Type: {field_type_name}, Kind: {field_kind}")
-        
-        # If the field is an object type, recursively fetch its fields
-        if field_kind == 'OBJECT' and field_type_name:
-            nested_type_info = fetch_type_info(api_url, headers, field_type_name)
-            if nested_type_info:
-                print_fields(nested_type_info['fields'], indent + 1)
-
-# Function to fetch type information
-def fetch_type_info(api_url, headers, type_name):
-    introspection_query = f"""
-    {{
-      __type(name: "{type_name}") {{
-        name
-        fields {{
-          name
-          type {{
-            name
-            kind
-            ofType {{
-              name
-              kind
-            }}
-          }}
-        }}
-      }}
-    }}
-    """
-    response = requests.post(api_url, json={'query': introspection_query}, headers=headers)
-    if response.status_code == 200:
-        return response.json()['data']['__type']
-    else:
-        raise Exception(f"Query failed with status code {response.status_code}: {response.text}")
-
-# Fetch and print schema information for 'Account'
-account_type_info = fetch_type_info(api_url, headers, "Account")
-print_fields(account_type_info['fields'])
+if __name__ == "__main__":
+    # Tune these if needed
+    OUTPUT_ROOT = os.environ.get("PUB_AQUA_OUT", "./pub_aqua_out")
+    MAX_WORKERS = int(os.environ.get("PUB_AQUA_WORKERS", "16"))
+    main(output_root=OUTPUT_ROOT, max_workers=MAX_WORKERS)
